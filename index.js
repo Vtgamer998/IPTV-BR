@@ -147,64 +147,60 @@ function parseM3U(rawText, opts = {}) {
 // ============================================================
 //  CARREGA M3U COM FALLBACK
 // ============================================================
-async function loadM3U() {
+let loadingPromise = null;
+
+// Vários pedidos ao mesmo tempo (o Nuvio pede vários catálogos) compartilham UMA única carga
+function loadM3U() {
   const now = Date.now();
+  if (cache && cache.length > 0 && (now - cacheTime < CACHE_DURATION)) return Promise.resolve(cache);
+  if (loadingPromise) return loadingPromise;
+  loadingPromise = doLoadM3U().finally(() => { loadingPromise = null; });
+  return loadingPromise;
+}
 
-  if (cache && cache.length > 0 && (now - cacheTime < CACHE_DURATION)) {
-    console.log(`📋 Cache ativo: ${cache.length} canais`);
-    return cache;
-  }
-
+async function doLoadM3U() {
   const axiosConfig = {
-    timeout: 30000,
+    timeout: 20000,
     maxRedirects: 10,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; IPTV-Brasil/4.1)',
-      'Accept': '*/*'
-    },
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; IPTV-Brasil/4.2)', 'Accept': '*/*' },
     responseType: 'text'
   };
 
-  // Junta TODAS as fontes (sem URLs repetidas); uma que falhar não derruba as outras
-  const merged = [];
-  const seen = new Set();
-  let okSources = 0;
-
-  for (let i = 0; i < M3U_SOURCES.length; i++) {
-    const { url, onlyBR } = M3U_SOURCES[i];
+  // Todas as fontes em paralelo; uma lenta ou quebrada não segura as outras
+  const results = await Promise.all(M3U_SOURCES.map(async ({ url, onlyBR }, i) => {
     try {
-      console.log(`🔄 Fonte ${i + 1}/${M3U_SOURCES.length}: ${url}${onlyBR ? ' (só Brasil)' : ''}`);
       const res = await axios.get(url, axiosConfig);
       const rawText = typeof res.data === 'string' ? res.data : String(res.data);
-
       if (!rawText.includes('#EXTM3U') && !rawText.includes('#EXTINF')) {
-        console.warn(`⚠️  Fonte ${i + 1} não retornou M3U válido (${rawText.length} bytes). Ignorando.`);
-        continue;
+        console.warn(`⚠️  Fonte ${i + 1} não retornou M3U válido: ${url}`);
+        return [];
       }
-
       const items = parseM3U(rawText, { onlyBR });
-      let added = 0;
-      for (const it of items) {
-        if (seen.has(it.url)) continue;
-        seen.add(it.url);
-        merged.push(it);
-        added++;
-      }
-      okSources++;
-      console.log(`✅ Fonte ${i + 1}: ${items.length} canais lidos, ${added} novos`);
+      console.log(`✅ Fonte ${i + 1}/${M3U_SOURCES.length}: ${items.length} canais (${url})`);
+      return items;
     } catch (err) {
-      console.error(`❌ Fonte ${i + 1} falhou: ${err.message}`);
+      console.error(`❌ Fonte ${i + 1} falhou (${url}): ${err.message}`);
+      return [];
+    }
+  }));
+
+  const merged = [];
+  const seen = new Set();
+  for (const items of results) {
+    for (const it of items) {
+      if (seen.has(it.url)) continue;
+      seen.add(it.url);
+      merged.push(it);
     }
   }
 
   if (merged.length > 0) {
     cache = merged;
-    cacheTime = now;
-    console.log(`📺 Total: ${merged.length} canais de ${okSources}/${M3U_SOURCES.length} fontes`);
+    cacheTime = Date.now();
+    console.log(`📺 Total: ${merged.length} canais`);
     return merged;
   }
 
-  // Todas as fontes falharam — usa cache antigo se disponível
   if (cache && cache.length > 0) {
     console.warn(`⚠️  Todas as fontes falharam. Usando cache expirado (${cache.length} canais).`);
     return cache;
@@ -267,7 +263,8 @@ builder.defineMetaHandler(async ({ id }) => {
     const ch = items.find(x => x.id === id);
     if (!ch) throw new Error(`Canal não encontrado: ${id}`);
 
-    await epg.loadEPG(axios, EPG_SOURCES);
+    // não espera o EPG baixar: se já estiver pronto usa, senão dispara em segundo plano
+    if (EPG_SOURCES.length) epg.loadEPG(axios, EPG_SOURCES).catch(() => {});
     const guide = epg.getNowNext(ch.name, ch.tvgId);
     const guideText = epg.describe(guide);
 
@@ -329,8 +326,9 @@ serveHTTP(builder.getInterface(), { port })
     console.log('🚀 ============================================');
 
     // Pré-carrega o cache ao iniciar
-    loadM3U().catch(err => console.error('⚠️  Erro no pré-carregamento:', err.message));
-    if (EPG_SOURCES.length) epg.loadEPG(axios, EPG_SOURCES).catch(err => console.error('⚠️  Erro no EPG:', err.message));
+    loadM3U()
+      .then(() => EPG_SOURCES.length ? epg.loadEPG(axios, EPG_SOURCES) : null) // EPG só depois das listas
+      .catch(err => console.error('⚠️  Erro no pré-carregamento:', err.message));
   })
   .catch(err => {
     console.error('❌ Erro ao iniciar servidor:', err);
