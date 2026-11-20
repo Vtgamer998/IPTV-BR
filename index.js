@@ -1,18 +1,27 @@
 const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
 const axios = require('axios');
+const crypto = require('crypto');
+const epg = require('./epg');
 
 // ============================================================
 //  LISTA DE M3Us — ordene do mais confiável pro menos
 //  Se a primeira falhar, tenta a próxima automaticamente
 // ============================================================
+// onlyBR: true => mantém só canais do Brasil / português do Brasil (filtra listas globais)
 const M3U_SOURCES = [
-  'http://abre.ai/manotv3',
-  'https://iptv-org.github.io/iptv/countries/br.m3u',
-  // Adicione outras fontes abaixo (substitua pelos seus links):
-  // 'https://raw.githubusercontent.com/SEU_USER/SEU_REPO/main/lista.m3u',
-  // 'https://outra-fonte.com/lista.m3u',
-  // 'https://terceira-fonte.com/iptv.m3u',
+  { url: 'http://abre.ai/manotv3' },
+  { url: 'https://iptv-org.github.io/iptv/countries/br.m3u' },
+  { url: 'https://iptv-org.github.io/iptv/index.m3u', onlyBR: true },
+  // Adicione outras fontes abaixo:
+  // { url: 'https://raw.githubusercontent.com/SEU_USER/SEU_REPO/main/lista.m3u' },
 ];
+
+// ============================================================
+//  EPG — XMLTV (opcional). Use EPG_URLS (separadas por vírgula) ou EPG_FILE
+//  Ex.: EPG_URLS=https://seu-host/epg-rich.xml
+// ============================================================
+const EPG_SOURCES = (process.env.EPG_URLS || process.env.EPG_FILE || '')
+  .split(',').map(x => x.trim()).filter(Boolean);
 
 const CATEGORIES = [
   { id: 'cat_globo',        name: 'Canais Globo',              keywords: ['globo','globonews','gnt','futura','viva','multishow','bis','woohoo','rpc','rbs','nsc','tv clube','inter tv','tv tem','rede amazonica','tv liberal'] },
@@ -44,7 +53,7 @@ const CATEGORIES = [
 
 const manifest = {
   id: 'com.iptv.brasil.addon',
-  version: '4.1.0',
+  version: '4.2.0',
   name: 'IPTV Brasil Pro',
   description: '🇧🇷 Addon IPTV brasileiro para Stremio e Nuvio!\n📺 Mais de 2000 canais em 25 categorias\n💰 Apoie: https://livepix.gg/willacris',
   contactEmail: 'willacris023@proton.me',
@@ -75,12 +84,22 @@ const CACHE_DURATION = 5 * 60 * 1000; // 5 minutos
 // ============================================================
 //  PARSER M3U
 // ============================================================
-function parseM3U(rawText) {
+// Só Brasil: tvg-id com sufixo .br (ex.: Globo.br@SD), tvg-country=BR ou idioma português sem ser de Portugal
+function isBrazilian(extinf, tvgId) {
+  if (tvgId && /\.br(@|$)/i.test(tvgId)) return true;
+  const country = ((extinf.match(/tvg-country="([^"]*)"/i) || [])[1] || '').toUpperCase();
+  const lang = ((extinf.match(/tvg-language="([^"]*)"/i) || [])[1] || '').toLowerCase();
+  if (country.split(/[;,]/).map(x => x.trim()).includes('BR')) return true;
+  return false;
+}
+
+function parseM3U(rawText, opts = {}) {
   const lines = rawText.split('\n');
   const items = [];
   const seenUrls = new Set();
   const logoRegex = /tvg-logo="([^"]+)"/;
   const groupRegex = /group-title="([^"]+)"/;
+  const tvgIdRegex = /tvg-id="([^"]+)"/;
 
   const VALID_PROTOCOLS = ['http://', 'https://', 'rtmp://', 'rtmps://', 'rtsp://', 'udp://', 'rtp://'];
   const INVALID_EXTS = ['.jpg','.jpeg','.png','.gif','.webp','.svg','.ico','.bmp','.txt','.html','.htm','.xml','.json','.zip','.rar','.mp4','.avi','.mkv','.mov'];
@@ -93,20 +112,23 @@ function parseM3U(rawText) {
     const groupMatch = line.match(groupRegex);
     const logo = logoMatch ? logoMatch[1] : 'https://img.icons8.com/color/480/tv.png';
     const group = groupMatch ? groupMatch[1] : 'Outros';
+    const tvgId = (line.match(tvgIdRegex) || [])[1] || null;
     const name = line.substring(line.indexOf(',') + 1).trim()
       .replace(/[🔴🟢⚫🟡]/g, '').trim();
     const url = (lines[i + 1] || '').trim();
 
+    if (opts.onlyBR && !isBrazilian(line, tvgId)) continue;
     if (!url || !name || seenUrls.has(url)) continue;
     if (!VALID_PROTOCOLS.some(p => url.toLowerCase().startsWith(p))) continue;
     if (INVALID_EXTS.some(ext => url.toLowerCase().endsWith(ext))) continue;
 
     seenUrls.add(url);
     items.push({
-      id: 'iptv_' + Buffer.from(url).toString('base64').slice(0, 32),
+      id: 'iptv_' + crypto.createHash('sha1').update(url).digest('hex').slice(0, 20),
       name,
       logo,
       group,
+      tvgId,
       url
     });
     i++; // pula a linha da URL
@@ -136,32 +158,43 @@ async function loadM3U() {
     responseType: 'text'
   };
 
+  // Junta TODAS as fontes (sem URLs repetidas); uma que falhar não derruba as outras
+  const merged = [];
+  const seen = new Set();
+  let okSources = 0;
+
   for (let i = 0; i < M3U_SOURCES.length; i++) {
-    const url = M3U_SOURCES[i];
+    const { url, onlyBR } = M3U_SOURCES[i];
     try {
-      console.log(`🔄 Tentando fonte ${i + 1}/${M3U_SOURCES.length}: ${url}`);
+      console.log(`🔄 Fonte ${i + 1}/${M3U_SOURCES.length}: ${url}${onlyBR ? ' (só Brasil)' : ''}`);
       const res = await axios.get(url, axiosConfig);
       const rawText = typeof res.data === 'string' ? res.data : String(res.data);
 
       if (!rawText.includes('#EXTM3U') && !rawText.includes('#EXTINF')) {
-        console.warn(`⚠️  Fonte ${i + 1} não retornou M3U válido (${rawText.length} bytes). Tentando próxima...`);
+        console.warn(`⚠️  Fonte ${i + 1} não retornou M3U válido (${rawText.length} bytes). Ignorando.`);
         continue;
       }
 
-      const items = parseM3U(rawText);
-      if (items.length === 0) {
-        console.warn(`⚠️  Fonte ${i + 1} retornou 0 canais. Tentando próxima...`);
-        continue;
+      const items = parseM3U(rawText, { onlyBR });
+      let added = 0;
+      for (const it of items) {
+        if (seen.has(it.url)) continue;
+        seen.add(it.url);
+        merged.push(it);
+        added++;
       }
-
-      cache = items;
-      cacheTime = now;
-      console.log(`✅ Fonte ${i + 1} OK: ${items.length} canais carregados!`);
-      return items;
-
+      okSources++;
+      console.log(`✅ Fonte ${i + 1}: ${items.length} canais lidos, ${added} novos`);
     } catch (err) {
       console.error(`❌ Fonte ${i + 1} falhou: ${err.message}`);
     }
+  }
+
+  if (merged.length > 0) {
+    cache = merged;
+    cacheTime = now;
+    console.log(`📺 Total: ${merged.length} canais de ${okSources}/${M3U_SOURCES.length} fontes`);
+    return merged;
   }
 
   // Todas as fontes falharam — usa cache antigo se disponível
@@ -207,7 +240,7 @@ builder.defineCatalogHandler(async ({ id, extra }) => {
         type: 'tv',
         name: ch.name,
         poster: ch.logo || 'https://img.icons8.com/color/480/tv.png',
-        description: `📺 ${ch.group}`,
+        description: [`📺 ${ch.group}`, epg.shortNow(epg.getNowNext(ch.name, ch.tvgId))].filter(Boolean).join('\n'),
         genres: ['IPTV'],
         releaseInfo: 'Ao Vivo'
       }));
@@ -227,14 +260,18 @@ builder.defineMetaHandler(async ({ id }) => {
     const ch = items.find(x => x.id === id);
     if (!ch) throw new Error(`Canal não encontrado: ${id}`);
 
+    await epg.loadEPG(axios, EPG_SOURCES);
+    const guide = epg.getNowNext(ch.name, ch.tvgId);
+    const guideText = epg.describe(guide);
+
     return {
       meta: {
         id: ch.id,
         type: 'tv',
         name: ch.name,
-        poster: ch.logo || 'https://img.icons8.com/color/480/tv.png',
-        background: ch.logo || 'https://img.icons8.com/color/480/tv.png',
-        description: `📺 ${ch.group}\n🇧🇷 Canal ao vivo 24h\n🔥 IPTV Brasil Pro v4.1.0`,
+        poster: ch.logo || (guide && guide.icon) || 'https://img.icons8.com/color/480/tv.png',
+        background: (guide && guide.current && guide.current.icon) || ch.logo || 'https://img.icons8.com/color/480/tv.png',
+        description: `📺 ${ch.group}\n🇧🇷 Canal ao vivo 24h\n\n${guideText || 'Guia indisponível para este canal.'}`,
         genres: ['IPTV'],
         releaseInfo: 'Ao Vivo'
       }
@@ -255,7 +292,7 @@ builder.defineStreamHandler(async ({ id }) => {
     return {
       streams: [{
         name: '📺 IPTV Brasil Pro',
-        title: `${ch.name}\n${ch.group} • Ao Vivo`,
+        title: [`${ch.name}`, `${ch.group} • Ao Vivo`, epg.shortNow(epg.getNowNext(ch.name, ch.tvgId))].filter(Boolean).join('\n'),
         url: ch.url,
         behaviorHints: {
           notWebReady: true,
@@ -277,14 +314,16 @@ const port = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port })
   .then(() => {
     console.log('🚀 ============================================');
-    console.log('🇧🇷  IPTV Brasil Pro v4.1.0');
+    console.log('🇧🇷  IPTV Brasil Pro v4.2.0');
     console.log(`📡 Porta: ${port}`);
     console.log(`📂 Categorias: ${CATEGORIES.length}`);
     console.log(`🔗 Fontes M3U: ${M3U_SOURCES.length}`);
+    console.log(`🗓️  Fontes EPG: ${EPG_SOURCES.length}`);
     console.log('🚀 ============================================');
 
     // Pré-carrega o cache ao iniciar
     loadM3U().catch(err => console.error('⚠️  Erro no pré-carregamento:', err.message));
+    if (EPG_SOURCES.length) epg.loadEPG(axios, EPG_SOURCES).catch(err => console.error('⚠️  Erro no EPG:', err.message));
   })
   .catch(err => {
     console.error('❌ Erro ao iniciar servidor:', err);
