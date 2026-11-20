@@ -72,6 +72,7 @@ const manifest = {
     name: cat.name,
     extra: [
       { name: 'search', isRequired: false },
+      { name: 'skip', isRequired: false },
       { name: 'genre', isRequired: false, options: ['IPTV'] }
     ]
   })),
@@ -87,6 +88,7 @@ const manifest = {
 let cache = null;
 let cacheTime = 0;
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutos
+const PAGE_SIZE = 300; // canais por página do catálogo (Stremio/Nuvio pedem as próximas com skip)
 
 // ============================================================
 //  PARSER M3U
@@ -147,18 +149,26 @@ function parseM3U(rawText, opts = {}) {
 // ============================================================
 //  CARREGA M3U COM FALLBACK
 // ============================================================
-let loadingPromise = null;
+let loadState = null;
+const FIRST_RESPONSE_MS = 6000; // o catálogo nunca espera mais que isso pelas listas
 
-// Vários pedidos ao mesmo tempo (o Nuvio pede vários catálogos) compartilham UMA única carga
-function loadM3U() {
-  const now = Date.now();
-  if (cache && cache.length > 0 && (now - cacheTime < CACHE_DURATION)) return Promise.resolve(cache);
-  if (loadingPromise) return loadingPromise;
-  loadingPromise = doLoadM3U().finally(() => { loadingPromise = null; });
-  return loadingPromise;
+function mergeResults(results) {
+  const merged = [];
+  const seen = new Set();
+  for (const items of results) {
+    for (const it of items || []) {
+      if (seen.has(it.url)) continue;
+      seen.add(it.url);
+      merged.push(it);
+    }
+  }
+  return merged;
 }
 
-async function doLoadM3U() {
+// Baixa todas as fontes em paralelo, em segundo plano. Cada fonte que termina já entra no cache.
+function startLoad() {
+  const hadCache = !!(cache && cache.length);
+  const results = new Array(M3U_SOURCES.length).fill(null);
   const axiosConfig = {
     timeout: 20000,
     maxRedirects: 10,
@@ -166,48 +176,54 @@ async function doLoadM3U() {
     responseType: 'text'
   };
 
-  // Todas as fontes em paralelo; uma lenta ou quebrada não segura as outras
-  const results = await Promise.all(M3U_SOURCES.map(async ({ url, onlyBR }, i) => {
+  const tasks = M3U_SOURCES.map(async ({ url, onlyBR }, i) => {
     try {
       const res = await axios.get(url, axiosConfig);
       const rawText = typeof res.data === 'string' ? res.data : String(res.data);
       if (!rawText.includes('#EXTM3U') && !rawText.includes('#EXTINF')) {
         console.warn(`⚠️  Fonte ${i + 1} não retornou M3U válido: ${url}`);
-        return [];
+        results[i] = [];
+        return;
       }
-      const items = parseM3U(rawText, { onlyBR });
-      console.log(`✅ Fonte ${i + 1}/${M3U_SOURCES.length}: ${items.length} canais (${url})`);
-      return items;
+      results[i] = parseM3U(rawText, { onlyBR });
+      console.log(`✅ Fonte ${i + 1}/${M3U_SOURCES.length}: ${results[i].length} canais (${url})`);
+      if (!hadCache) cache = mergeResults(results); // sem cache anterior: já mostra o que chegou
     } catch (err) {
+      results[i] = [];
       console.error(`❌ Fonte ${i + 1} falhou (${url}): ${err.message}`);
-      return [];
     }
-  }));
+  });
 
-  const merged = [];
-  const seen = new Set();
-  for (const items of results) {
-    for (const it of items) {
-      if (seen.has(it.url)) continue;
-      seen.add(it.url);
-      merged.push(it);
+  const done = Promise.all(tasks).then(() => {
+    const merged = mergeResults(results);
+    if (merged.length > 0) {
+      cache = merged;
+      cacheTime = Date.now();
+      console.log(`📺 Total: ${merged.length} canais`);
+    } else {
+      console.error('❌ Nenhuma fonte entregou canais.');
     }
-  }
+    loadState = null;
+  });
 
-  if (merged.length > 0) {
-    cache = merged;
-    cacheTime = Date.now();
-    console.log(`📺 Total: ${merged.length} canais`);
-    return merged;
-  }
+  loadState = { done };
+}
 
-  if (cache && cache.length > 0) {
-    console.warn(`⚠️  Todas as fontes falharam. Usando cache expirado (${cache.length} canais).`);
-    return cache;
+async function loadM3U() {
+  if (cache && cache.length > 0 && Date.now() - cacheTime < CACHE_DURATION) return cache;
+  if (!loadState) startLoad();
+  // Já tem algo (parcial ou antigo)? Responde na hora, a atualização continua por trás.
+  if (cache && cache.length > 0) return cache;
+  // Primeira carga: espera no máximo FIRST_RESPONSE_MS e devolve o que já chegou.
+  // Sai antes se já chegou alguma lista (pequena folga para somar as mais rápidas).
+  const t0 = Date.now();
+  let finished = false;
+  loadState.done.then(() => { finished = true; });
+  while (!finished && Date.now() - t0 < FIRST_RESPONSE_MS) {
+    if (cache && cache.length > 0 && Date.now() - t0 >= 1500) break;
+    await new Promise(r => setTimeout(r, 150));
   }
-
-  console.error('❌ Sem canais disponíveis. Retornando lista vazia.');
-  return [];
+  return cache || [];
 }
 
 // ============================================================
@@ -222,6 +238,7 @@ builder.defineCatalogHandler(async ({ id, extra }) => {
     if (!category) return { metas: [] };
 
     const searchQuery = extra?.search?.toLowerCase() || null;
+    const skip = Math.max(0, parseInt(extra?.skip, 10) || 0);
 
     const metas = items
       .filter(ch => {
@@ -238,6 +255,7 @@ builder.defineCatalogHandler(async ({ id, extra }) => {
         }
         return true;
       })
+      .slice(skip, skip + PAGE_SIZE)
       .map(ch => ({
         id: ch.id,
         type: 'tv',
@@ -248,8 +266,8 @@ builder.defineCatalogHandler(async ({ id, extra }) => {
         releaseInfo: 'Ao Vivo'
       }));
 
-    console.log(`📺 "${category.name}": ${metas.length} canais`);
-    return { metas };
+    console.log(`📺 "${category.name}": ${metas.length} canais (skip ${skip})`);
+    return metas.length ? { metas, cacheMaxAge: 300, staleRevalidate: 3600 } : { metas };
 
   } catch (err) {
     console.error('❌ catalogHandler:', err.message);
@@ -337,4 +355,4 @@ serveHTTP(builder.getInterface(), { port })
 
 process.on('uncaughtException', err  => console.error('❌ uncaughtException:', err));
 process.on('unhandledRejection', err => console.error('❌ unhandledRejection:', err));
-                                                                          
+  
