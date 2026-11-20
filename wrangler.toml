@@ -1,0 +1,11 @@
+name = "iptv-br"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+[[kv_namespaces]]
+binding = "IPTV_KV"
+id = "20dabfc5b781459885a1deb262de891c"
+
+# Roda a cada 10 min; cada execução atualiza só 1/3 das fontes (cabe no limite de CPU do plano free)
+[triggers]
+crons = ["*/10 * * * *"]
