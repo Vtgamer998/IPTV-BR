@@ -46,7 +46,7 @@ const CATEGORIES = [
 
 const manifest = {
   id: 'com.iptv.brasil.addon',
-  version: '5.0.0',
+  version: '5.1.0',
   name: 'IPTV Brasil Pro',
   description: '🇧🇷 Addon IPTV brasileiro para Stremio e Nuvio!\n📺 Milhares de canais em 25 categorias',
   resources: ['catalog', 'stream', 'meta'],
@@ -104,14 +104,34 @@ async function load(src) {
 }
 
 const results = await Promise.all(M3U_SOURCES.map(load));
-const seen = new Set();
-const channels = [];
-for (const list of results) for (const it of list) {
-  if (seen.has(it.url)) continue;
-  seen.add(it.url);
-  channels.push({ id: 'iptv_' + createHash('sha1').update(it.url).digest('hex').slice(0, 20), ...it });
+
+// Junta o mesmo canal (HD/FHD/SD/4K...) em um só, com várias opções de stream
+const QUAL = /\b(4K|UHD|FHD|HD|SD|H\.?265|HEVC|1080p?|720p?|480p?)\b/gi;
+const cleanName = n => n.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(QUAL, ' ').replace(/[-_|:]+\s*$/, '').replace(/\s+/g, ' ').trim();
+const qualLabel = n => { const m = n.match(QUAL); return m ? [...new Set(m.map(x => x.toUpperCase()))].join(' ') : 'Padrão'; };
+const sha = t => createHash('sha1').update(t).digest('hex');
+
+const groups = new Map();
+const seenUrl = new Set();
+results.forEach((list, si) => {
+  for (const it of list) {
+    if (seenUrl.has(it.url)) continue;
+    seenUrl.add(it.url);
+    const base = cleanName(it.name) || it.name;
+    const key = base.toLowerCase();
+    let g = groups.get(key);
+    if (!g) { g = { id: 'iptv_' + sha(key).slice(0, 20), name: base, logo: it.logo, group: it.group, streams: [] }; groups.set(key, g); }
+    if (!g.logo && it.logo) g.logo = it.logo;
+    const hls = /\.m3u8(\?|$)/i.test(it.url);
+    g.streams.push({ label: qualLabel(it.name) + (hls ? ' HLS' : ''), url: it.url, si, hls });
+  }
+});
+const channels = [...groups.values()];
+for (const g of channels) {
+  g.streams.sort((a, b) => (b.hls - a.hls) || (a.url.startsWith('https') ? 0 : 1) - (b.url.startsWith('https') ? 0 : 1) || a.si - b.si);
+  g.streams = g.streams.slice(0, 15);
 }
-console.log('Total:', channels.length);
+console.log('Links:', seenUrl.size, '— Canais:', channels.length);
 if (channels.length < 50) { console.error('Poucos canais — abortando para não apagar os dados atuais.'); process.exit(1); }
 
 rmSync(OUT, { recursive: true, force: true });
@@ -139,7 +159,7 @@ for (const cat of CATEGORIES) {
 
 // shards para meta/stream: d/<2 primeiros hex do id>.json
 const shards = {};
-for (const ch of channels) (shards[ch.id.slice(5, 7)] ||= {})[ch.id] = [ch.name, ch.logo, ch.group, ch.url];
+for (const ch of channels) (shards[ch.id.slice(5, 7)] ||= {})[ch.id] = [ch.name, ch.logo, ch.group, ch.streams.map(x => [x.label, x.url])];
 for (const [k, v] of Object.entries(shards)) write(`d/${k}.json`, v);
 console.log('Shards:', Object.keys(shards).length);
-   
+                            
