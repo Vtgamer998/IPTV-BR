@@ -1,3 +1,4 @@
+
 // ============================================================
 //  EPG (XMLTV) — guia de programação "Agora / A seguir"
 //  Fontes: EPG_URLS (separadas por vírgula) ou EPG_FILE (arquivo local)
@@ -36,42 +37,77 @@ const pick = (body, tag) => {
   return m ? unesc(m[1]) : '';
 };
 
-function parseXMLTV(xml, now) {
-  const channels = new Map(), byName = new Map(), progs = new Map();
+function parseChannelEl(el, out) {
+  const m = /^<channel id="([^"]+)">([\s\S]*?)<\/channel>$/.exec(el);
+  if (!m) return;
+  const id = unesc(m[1]);
+  const names = [...m[2].matchAll(/<display-name[^>]*>([\s\S]*?)<\/display-name>/g)].map(x => unesc(x[1]));
+  const icon = (/<icon src="([^"]+)"/.exec(m[2]) || [])[1];
+  out.channels.set(id, { id, names, icon: icon ? unesc(icon) : null });
+  [id.replace(/\.[a-z]{2}$/i, ''), ...names].forEach(n => {
+    const k = normalize(n);
+    if (k && !out.byName.has(k)) out.byName.set(k, id);
+  });
+}
+
+function parseProgEl(el, out, lo, hi) {
+  const m = /^<programme start="(\d{14})(?: ([+-]\d{4}))?" stop="(\d{14})(?: ([+-]\d{4}))?" channel="([^"]+)">([\s\S]*?)<\/programme>$/.exec(el);
+  if (!m) return;
+  const start = toMs(m[1], m[2]), stop = toMs(m[3], m[4] || m[2]);
+  if (!(stop > lo && start < hi)) return;
+  const body = m[6];
+  const icon = (/<icon src="([^"]+)"/.exec(body) || [])[1];
+  const ch = unesc(m[5]);
+  if (!out.progs.has(ch)) out.progs.set(ch, []);
+  out.progs.get(ch).push({
+    start, stop,
+    title: pick(body, 'title'),
+    sub: pick(body, 'sub-title'),
+    desc: pick(body, 'desc').slice(0, 300),
+    icon: icon ? unesc(icon) : null
+  });
+}
+
+// Lê o XMLTV aos poucos (stream), sem nunca guardar o arquivo inteiro em memória
+// e devolvendo o controle ao servidor entre os blocos (não trava as requisições).
+async function parseStream(readable, now) {
+  const { StringDecoder } = require('string_decoder');
+  const dec = new StringDecoder('utf8');
+  const out = { channels: new Map(), byName: new Map(), progs: new Map() };
   const lo = now - WINDOW_BACK_MS, hi = now + WINDOW_AHEAD_MS;
+  let buf = '';
 
-  const chRe = /<channel id="([^"]+)">([\s\S]*?)<\/channel>/g;
-  let m;
-  while ((m = chRe.exec(xml))) {
-    const id = unesc(m[1]);
-    const names = [...m[2].matchAll(/<display-name[^>]*>([\s\S]*?)<\/display-name>/g)].map(x => unesc(x[1]));
-    const icon = (/<icon src="([^"]+)"/.exec(m[2]) || [])[1];
-    channels.set(id, { id, names, icon: icon ? unesc(icon) : null });
-    [id.replace(/\.[a-z]{2}$/i, ''), ...names].forEach(n => {
-      const k = normalize(n);
-      if (k && !byName.has(k)) byName.set(k, id);
-    });
-  }
+  const drain = (final) => {
+    for (;;) {
+      const ci = buf.indexOf('<channel id=');
+      const pi = buf.indexOf('<programme ');
+      let i, endTag, isCh;
+      if (ci === -1 && pi === -1) { buf = final ? '' : buf.slice(-20); return; }
+      if (pi === -1 || (ci !== -1 && ci < pi)) { i = ci; endTag = '</channel>'; isCh = true; }
+      else { i = pi; endTag = '</programme>'; isCh = false; }
+      const e = buf.indexOf(endTag, i);
+      if (e === -1) { buf = buf.slice(i); return; } // elemento incompleto: espera o próximo bloco
+      const el = buf.slice(i, e + endTag.length);
+      buf = buf.slice(e + endTag.length);
+      if (isCh) parseChannelEl(el, out); else parseProgEl(el, out, lo, hi);
+    }
+  };
 
-  const prRe = /<programme start="(\d{14})(?: ([+-]\d{4}))?" stop="(\d{14})(?: ([+-]\d{4}))?" channel="([^"]+)">([\s\S]*?)<\/programme>/g;
-  while ((m = prRe.exec(xml))) {
-    const start = toMs(m[1], m[2]), stop = toMs(m[3], m[4] || m[2]);
-    if (!(stop > lo && start < hi)) continue;
-    const body = m[6];
-    const icon = (/<icon src="([^"]+)"/.exec(body) || [])[1];
-    const p = {
-      start, stop,
-      title: pick(body, 'title'),
-      sub: pick(body, 'sub-title'),
-      desc: pick(body, 'desc').slice(0, 500),
-      icon: icon ? unesc(icon) : null
-    };
-    const ch = unesc(m[5]);
-    if (!progs.has(ch)) progs.set(ch, []);
-    progs.get(ch).push(p);
+  for await (const chunk of readable) {
+    buf += typeof chunk === 'string' ? chunk : dec.write(chunk);
+    drain(false);
+    await new Promise(r => setImmediate(r)); // respira: deixa o servidor atender requisições
   }
-  for (const arr of progs.values()) arr.sort((a, b) => a.start - b.start);
-  return { channels, byName, progs };
+  buf += dec.end();
+  drain(true);
+  for (const arr of out.progs.values()) arr.sort((a, b) => a.start - b.start);
+  return out;
+}
+
+// Versão simples (texto inteiro) — usada só em testes
+function parseXMLTV(xml, now) {
+  const { Readable } = require('stream');
+  return parseStream(Readable.from([xml]), now);
 }
 
 function merge(into, add) {
@@ -80,16 +116,15 @@ function merge(into, add) {
   for (const [k, v] of add.progs)    if (!into.progs.has(k))    into.progs.set(k, v);
 }
 
-async function readSource(src, axios) {
+async function openSource(src, axios) {
   if (/^https?:\/\//i.test(src)) {
     const res = await axios.get(src, {
-      timeout: 120000, maxRedirects: 10, responseType: 'text',
-      maxContentLength: Infinity, maxBodyLength: Infinity,
+      timeout: 60000, maxRedirects: 10, responseType: 'stream',
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; IPTV-Brasil/4.2)' }
     });
-    return typeof res.data === 'string' ? res.data : String(res.data);
+    return res.data;
   }
-  return fs.readFileSync(src, 'utf8');
+  return fs.createReadStream(src, { encoding: null, highWaterMark: 256 * 1024 });
 }
 
 async function loadEPG(axios, sources) {
@@ -102,9 +137,8 @@ async function loadEPG(axios, sources) {
     const fresh = { channels: new Map(), byName: new Map(), progs: new Map() };
     for (const src of sources) {
       try {
-        let xml = await readSource(src, axios);
-        merge(fresh, parseXMLTV(xml, Date.now()));
-        xml = null; // libera memória
+        const stream = await openSource(src, axios);
+        merge(fresh, await parseStream(stream, Date.now()));
         console.log(`🗓️  EPG OK: ${src} (${fresh.channels.size} canais, ${fresh.progs.size} com programação)`);
       } catch (err) {
         console.error(`❌ EPG falhou (${src}): ${err.message}`);
@@ -155,4 +189,5 @@ function describe(info) {
 
 const shortNow = info => (info && info.current ? `Agora: ${info.current.title}` : '');
 
-module.exports = { loadEPG, getNowNext, describe, shortNow, normalize, parseXMLTV, _store: () => store };
+module.exports = { loadEPG, parseStream, getNowNext, describe, shortNow, normalize, parseXMLTV, _store: () => store };
+                                     
