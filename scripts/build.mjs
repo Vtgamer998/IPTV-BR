@@ -1,6 +1,6 @@
 // Gera os arquivos estáticos do addon (rodado pelo GitHub Actions). Node 18+.
 import { createHash } from 'node:crypto';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 
 const M3U_SOURCES = [
   { url: 'http://abre.ai/manotv3' },
@@ -105,6 +105,11 @@ async function load(src) {
 
 const results = await Promise.all(M3U_SOURCES.map(load));
 
+// links que o check.mjs viu cortando em poucos segundos ficam de fora
+const checked = existsSync('data/checked.json') ? JSON.parse(readFileSync('data/checked.json', 'utf8')) : {};
+const isCut = u => checked[createHash('sha1').update(u).digest('hex').slice(0, 10)] === 'cut';
+let dropped = 0;
+
 // Junta o mesmo canal (HD/FHD/SD/4K...) em um só, com várias opções de stream
 const QUAL = /\b(4K|UHD|FHD|HD|SD|H\.?265|HEVC|1080p?|720p?|480p?)\b/gi;
 const cleanName = n => n.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(QUAL, ' ').replace(/[-_|:]+\s*$/, '').replace(/\s+/g, ' ').trim();
@@ -116,6 +121,7 @@ const seenUrl = new Set();
 results.forEach((list, si) => {
   for (const it of list) {
     if (seenUrl.has(it.url)) continue;
+    if (isCut(it.url)) { dropped++; continue; }
     seenUrl.add(it.url);
     const base = cleanName(it.name) || it.name;
     const key = base.toLowerCase();
@@ -131,7 +137,7 @@ for (const g of channels) {
   g.streams.sort((a, b) => (b.hls - a.hls) || (a.url.startsWith('https') ? 0 : 1) - (b.url.startsWith('https') ? 0 : 1) || a.si - b.si);
   g.streams = g.streams.slice(0, 15);
 }
-console.log('Links:', seenUrl.size, '— Canais:', channels.length);
+console.log('Removidos (cortam):', dropped, '| Links:', seenUrl.size, '— Canais:', channels.length);
 if (channels.length < 50) { console.error('Poucos canais — abortando para não apagar os dados atuais.'); process.exit(1); }
 
 rmSync(OUT, { recursive: true, force: true });
@@ -162,4 +168,3 @@ const shards = {};
 for (const ch of channels) (shards[ch.id.slice(5, 7)] ||= {})[ch.id] = [ch.name, ch.logo, ch.group, ch.streams.map(x => [x.label, x.url])];
 for (const [k, v] of Object.entries(shards)) write(`d/${k}.json`, v);
 console.log('Shards:', Object.keys(shards).length);
-                            
