@@ -12,6 +12,13 @@ const M3U_SOURCES = [
   { url: 'http://abre.ai/manotv3' },
   { url: 'https://iptv-org.github.io/iptv/countries/br.m3u' },
   { url: 'https://iptv-org.github.io/iptv/index.m3u', onlyBR: true },
+  // Ramys/Iptv-Brasil-2026 (canais ao vivo; Filmes-Series.m3u8 fica de fora por ser VOD)
+  { url: 'https://raw.githubusercontent.com/Ramys/Iptv-Brasil-2026/master/Canais.m3u8' },
+  { url: 'https://raw.githubusercontent.com/Ramys/Iptv-Brasil-2026/master/CanaisBR01.m3u8' },
+  { url: 'https://raw.githubusercontent.com/Ramys/Iptv-Brasil-2026/master/CanaisBR02.m3u8' },
+  { url: 'https://raw.githubusercontent.com/Ramys/Iptv-Brasil-2026/master/CanaisBR03.m3u8' },
+  { url: 'https://raw.githubusercontent.com/Ramys/Iptv-Brasil-2026/master/CanaisBR04.m3u8' },
+  { url: 'https://raw.githubusercontent.com/Ramys/Iptv-Brasil-2026/master/CanaisIPTV.m3u8' },
   // Adicione outras fontes abaixo:
   // { url: 'https://raw.githubusercontent.com/SEU_USER/SEU_REPO/main/lista.m3u' },
 ];
@@ -332,4 +339,4 @@ serveHTTP(builder.getInterface(), { port })
 
 process.on('uncaughtException', err  => console.error('❌ uncaughtException:', err));
 process.on('unhandledRejection', err => console.error('❌ unhandledRejection:', err));
-      
+                                                                          
