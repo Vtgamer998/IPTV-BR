@@ -1,22 +1,36 @@
 name: Atualizar canais
 on:
   schedule:
-    - cron: '0 */3 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: atualizar-canais
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: node scripts/build.mjs
-      - run: |
+      - name: Gerar catálogo
+        run: node scripts/build.mjs
+      - name: Salvar
+        run: |
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
-          git add -A public
+          git add -A public data
           git diff --cached --quiet || (git commit -m "Atualiza canais" && git push)
+      - name: Testar links (remove os que cortam em ~30s)
+        run: node scripts/check.mjs
+      - name: Gerar catálogo filtrado
+        run: node scripts/build.mjs
+      - name: Salvar de novo
+        run: |
+          git add -A public data
+          git diff --cached --quiet || (git commit -m "Remove links que cortam" && git push)
           
