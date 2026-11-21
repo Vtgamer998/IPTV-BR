@@ -24,18 +24,19 @@ export default {
       if (!res.ok) return json(m[1] === 'meta' ? { meta: null } : { streams: [] });
       const ch = (await res.json())[id];
       if (!ch) return json(m[1] === 'meta' ? { meta: null } : { streams: [] });
-      const [name, logo, group, streamUrl] = ch;
+      const [name, logo, group, streams] = ch;
       const img = logo || 'https://img.icons8.com/color/480/tv.png';
       if (m[1] === 'meta') {
         return json({ meta: { id, type: 'tv', name, poster: img, background: img,
-          description: `📺 ${group}\n🇧🇷 Canal ao vivo 24h`, genres: ['IPTV'], releaseInfo: 'Ao Vivo' } });
+          description: `📺 ${group}\n🇧🇷 Canal ao vivo 24h\n🔁 ${streams.length} opção(ões) de transmissão — se travar, escolha outra`, genres: ['IPTV'], releaseInfo: 'Ao Vivo' } });
       }
-      return json({ streams: [{
-        name: '📺 IPTV Brasil Pro',
-        title: `${name}\n${group} • Ao Vivo`,
-        url: streamUrl,
+      const host = u => { try { return new URL(u).hostname; } catch { return ''; } };
+      return json({ streams: streams.map(([label, u], i) => ({
+        name: `📺 ${label}`,
+        title: `${name}\nOpção ${i + 1}/${streams.length} • ${host(u)}`,
+        url: u,
         behaviorHints: { notWebReady: true, bingeGroup: `iptv-${group.toLowerCase().replace(/\s+/g, '-')}` },
-      }] });
+      })) });
     }
 
     if (path === '/manifest.json' || path.startsWith('/catalog/tv/')) {
@@ -46,3 +47,4 @@ export default {
     return json({ error: 'not found' });
   },
 };
+                                                
